@@ -161,6 +161,7 @@ def connection(**kwargs):
     if kwargs:
         password = kwargs.pop("password")
         username = format_username(kwargs)
+    logger.debug(f"{username=}, {password=}, {kwargs=}")
     # Build server pool
     server_pool = ldap3.ServerPool(
         None, ldap3.RANDOM,
@@ -168,6 +169,7 @@ def connection(**kwargs):
         exhaust=5
     )
     auth_url = settings.LDAP_AUTH_URL
+    logger.debug(f"LDAP auth URL: {auth_url=}")
     if not isinstance(auth_url, list):
         auth_url = [auth_url]
     for u in auth_url:
@@ -185,6 +187,7 @@ def connection(**kwargs):
                 version=settings.LDAP_AUTH_TLS_VERSION,
                 **settings.LDAP_AUTH_TLS_ARGS
             )
+        logger.debug(f"LDAP server args: {server_args}")
         server_pool.add(
             ldap3.Server(
                 u,
@@ -192,30 +195,50 @@ def connection(**kwargs):
             )
         )
     # Connect.
+    logger.debug("LDAP server connection prepared")
     try:
         connection_args = {
             "user": username,
             "password": password,
             "auto_bind": False,
-            "raise_exceptions": True,
+            # "raise_exceptions": True,
+            "raise_exceptions": False,
             "receive_timeout": settings.LDAP_AUTH_RECEIVE_TIMEOUT,
         }
+        logger.debug(f"LDAP connection args: {connection_args}")
+        logger.debug(f"{server_pool}")
         c = ldap3.Connection(
             server_pool,
             **connection_args,
         )
+        logger.debug("LDAP connection prepared")
     except LDAPException as ex:
         logger.warning("LDAP connect failed: {ex}".format(ex=ex))
         yield None
         return
     # Configure.
+    logger.debug("Setting configuration for LDAP connection")
     try:
         # Start TLS, if requested.
+
         if settings.LDAP_AUTH_USE_TLS:
             c.start_tls(read_server_info=False)
         # Perform initial authentication bind.
-        c.bind(read_server_info=True)
+        logger.debug("Performing initial authentification bind")
+        import socket
+        socket.setdefaulttimeout(1)
+        try:
+            c.bind(read_server_info=True)
+        except LDAPException as ex:
+            import traceback
+            logger.debug(traceback.format_exc())
+            logger.warning("LDAP bind failed: {ex}".format(ex=ex))
+            yield None
+        socket.setdefaulttimeout(None)
+        logger.debug("LDAP connection established")
         User = get_user_model()
+        logger.debug(f"{User=}, {User.USERNAME_FIELD=}")
+        logger.debug(f"{settings.LDAP_AUTH_CONNECTION_USERNAME=}, {settings.LDAP_AUTH_CONNECTION_PASSWORD=}")
         # If the settings specify an alternative username and password for querying, rebind as that.
         settings_username = (
             format_username(
@@ -225,9 +248,25 @@ def connection(**kwargs):
             else None
         )
         settings_password = settings.LDAP_AUTH_CONNECTION_PASSWORD
+        logger.debug(f"{username=}, {password=}")
+        logger.debug(f"{settings_username=}, {settings_password=}")
+        LDAP_AUTH_CONNECTION_USERNAME = "cn=admin,dc=myorg,dc=local"
+        settings_username=LDAP_AUTH_CONNECTION_USERNAME
+
+        logger.debug("changing the code of ldap")
+        logger.debug(f"{settings_username=}, {settings_password=}")
+        settings_username=settings.LDAP_AUTH_CONNECTION_USERNAME
+
+
+
+        logger.debug(f"{username=}, {password=}")
+        logger.debug(f"{settings_username=}, {settings_password=}")
+
         if (settings_username or settings_password) and (
             settings_username != username or settings_password != password
         ):
+            logger.debug(f"{username=}, {password=}")
+            logger.debug(f"{settings_username=}, {settings_password=}")
             c.rebind(
                 user=settings_username,
                 password=settings_password,
@@ -236,6 +275,8 @@ def connection(**kwargs):
         logger.info("LDAP connect succeeded")
         yield Connection(c)
     except LDAPException as ex:
+        import traceback
+        logger.debug(traceback.format_exc())
         logger.warning("LDAP bind failed: {ex}".format(ex=ex))
         yield None
     finally:
