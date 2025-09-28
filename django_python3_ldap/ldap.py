@@ -10,9 +10,25 @@ from contextlib import contextmanager
 from django.contrib.auth import get_user_model
 from django_python3_ldap.conf import settings
 from django_python3_ldap.utils import import_func, format_search_filter
+from urllib.parse import urlparse
+import socket
 
 
 logger = logging.getLogger(__name__)
+
+def _ldap_endpoints(urls):
+    """Rozparsuje LDAP URL na seznam (host, port)."""
+    if not isinstance(urls, list):
+        urls = [urls]
+    endpoints = []
+    for u in urls:
+        p = urlparse(u)
+        host = p.hostname
+        port = p.port or (636 if p.scheme == "ldaps" else 389)
+        endpoints.append((host, port))
+    return endpoints
+
+
 
 
 class Connection(object):
@@ -162,6 +178,25 @@ def connection(**kwargs):
         password = kwargs.pop("password")
         username = format_username(kwargs)
     logger.debug(f"{username=}, {password=}, {kwargs=}")
+
+    # --- PRE-FLIGHT TCP CHECK ---
+    endpoints = _ldap_endpoints(settings.LDAP_AUTH_URL)
+    reachable = False
+    for host, port in endpoints:
+        try:
+            with socket.create_connection((host, port), timeout=1):
+                reachable = True
+                break
+        except OSError:
+            continue
+
+    if not reachable:
+        logger.warning("No LDAP endpoint reachable, falling back to ModelBackend.")
+        yield None
+        return
+    # --- END PRE-FLIGHT ---
+
+
     # Build server pool
     server_pool = ldap3.ServerPool(
         None, ldap3.RANDOM,
@@ -196,16 +231,18 @@ def connection(**kwargs):
         )
     # Connect.
     logger.debug("LDAP server connection prepared")
+    connection_args = {
+        "user": username,
+        "password": password,
+        "auto_bind": False,
+        # "raise_exceptions": True,
+        "raise_exceptions": False,
+        "receive_timeout": settings.LDAP_AUTH_RECEIVE_TIMEOUT,
+    }
+    logger.debug(f"LDAP connection args: {connection_args}")
+
+
     try:
-        connection_args = {
-            "user": username,
-            "password": password,
-            "auto_bind": False,
-            # "raise_exceptions": True,
-            "raise_exceptions": False,
-            "receive_timeout": settings.LDAP_AUTH_RECEIVE_TIMEOUT,
-        }
-        logger.debug(f"LDAP connection args: {connection_args}")
         logger.debug(f"{server_pool}")
         c = ldap3.Connection(
             server_pool,
@@ -223,18 +260,9 @@ def connection(**kwargs):
 
         if settings.LDAP_AUTH_USE_TLS:
             c.start_tls(read_server_info=False)
-        # Perform initial authentication bind.
         logger.debug("Performing initial authentification bind")
-        import socket
-        socket.setdefaulttimeout(1)
-        try:
-            c.bind(read_server_info=True)
-        except LDAPException as ex:
-            import traceback
-            logger.debug(traceback.format_exc())
-            logger.warning("LDAP bind failed: {ex}".format(ex=ex))
-            yield None
-        socket.setdefaulttimeout(None)
+        c.bind(read_server_info=True)
+
         logger.debug("LDAP connection established")
         User = get_user_model()
         logger.debug(f"{User=}, {User.USERNAME_FIELD=}")
